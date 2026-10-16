@@ -1,0 +1,6 @@
+sources/files/
+notebooks/.ipynb_checkpoints/
+__pycache__/
+results/
+.env
+fingerprints/

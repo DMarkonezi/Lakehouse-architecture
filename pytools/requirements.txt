@@ -1,0 +1,10 @@
+pyiceberg[pyarrow,duckdb,pandas]==0.9.1
+pyarrow==19.0.1
+duckdb==1.2.2
+pandas==2.2.3
+trino==0.333.0
+streamlit==1.45.1
+altair==5.5.0
+scikit-learn==1.6.1
+graphviz==0.20.3
+jupyterlab==4.4.2

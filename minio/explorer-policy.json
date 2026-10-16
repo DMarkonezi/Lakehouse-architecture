@@ -1,0 +1,11 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {"Effect": "Allow", "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
+     "Resource": ["arn:aws:s3:::warehouse"]},
+    {"Effect": "Allow", "Action": ["s3:GetObject"], "Resource": ["arn:aws:s3:::warehouse/*"]},
+    {"Effect": "Allow",
+     "Action": ["s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"],
+     "Resource": ["arn:aws:s3:::warehouse/ml/*", "arn:aws:s3:::warehouse/demo/*"]}
+  ]
+}

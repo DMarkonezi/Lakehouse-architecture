@@ -1,0 +1,192 @@
+# ecommerce-lakehouse: Apache Iceberg lakehouse za regionalnu online prodavnicu tehnike
+#
+#   Izvori:    PostgreSQL (OLTP) | CSV platnog provajdera i kursne liste | JSON clickstream
+#   Skladiste: MinIO - S3 API                       http://localhost:9001
+#   Katalog:   Iceberg REST katalog                 http://localhost:8181
+#   Masine:    Spark (pise)          Jupyter        http://localhost:8888
+#              Trino (samo cita)                    localhost:8085
+#              Python/PyIceberg/DuckDB  Jupyter     http://localhost:8889
+#   Prikaz:    Streamlit "Lakehouse Console"        http://localhost:8501
+#
+# Verzije image-a su fiksne: bitnamilegacy/minio i tabulario/spark-iceberg se vise ne razvijaju,
+# pa ostajemo na kombinaciji koja je testirana.
+
+x-s3-env: &s3-region
+  AWS_REGION: us-east-1
+
+services:
+  # ------------------------------------------------------------------ skladiste
+  minio:
+    image: bitnamilegacy/minio:2025.4.22
+    container_name: minio
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_DEFAULT_BUCKETS: warehouse
+    ports: ["9000:9000", "9001:9001"]
+    volumes: [minio-data:/bitnami/minio/data]
+    mem_limit: 1g
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      retries: 30
+
+  # korisnici sa najmanjim privilegijama: spark/explorer/catalog citaju i pisu, trino samo cita
+  minio-setup:
+    image: bitnamilegacy/minio:2025.4.22
+    container_name: minio-setup
+    depends_on:
+      minio: {condition: service_healthy}
+    entrypoint: ["/bin/sh", "/setup/setup.sh"]
+    env_file: .env
+    volumes:
+      - ./minio/setup.sh:/setup/setup.sh:ro
+      - ./minio/explorer-policy.json:/setup/explorer-policy.json:ro
+    restart: "no"
+
+  # ------------------------------------------------------------------ katalog
+  iceberg-rest:
+    image: apache/iceberg-rest-fixture:1.9.2
+    container_name: iceberg-rest
+    depends_on:
+      minio-setup: {condition: service_completed_successfully}
+    ports: ["8181:8181"]
+    environment:
+      <<: *s3-region
+      AWS_ACCESS_KEY_ID: ${CATALOG_S3_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${CATALOG_S3_SECRET_KEY}
+      CATALOG_WAREHOUSE: s3://warehouse/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+      CATALOG_URI: jdbc:sqlite:file:/catalog/iceberg_catalog.db
+      CATALOG_JDBC_USER: user
+      CATALOG_JDBC_PASSWORD: password
+    volumes: [catalog-data:/catalog]
+    user: root
+    mem_limit: 512m
+
+  # ------------------------------------------------------------------ izvor: OLTP baza prodavnice
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      LAKE_READER_USER: ${LAKE_READER_USER}
+      LAKE_READER_PASSWORD: ${LAKE_READER_PASSWORD}
+    ports: ["5433:5432"]
+    volumes:
+      - ./sources/postgres/init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+      - ./sources/postgres/reader.sh:/docker-entrypoint-initdb.d/02_reader.sh:ro
+      - ./sources/files:/sources:ro
+      - pg-data:/var/lib/postgresql/data
+    mem_limit: 768m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      retries: 30
+
+  # ------------------------------------------------------------------ masina 1: Spark (ETL, odrzavanje)
+  spark-iceberg:
+    image: tabulario/spark-iceberg:3.5.5_1.8.1
+    container_name: spark-iceberg
+    depends_on:
+      iceberg-rest: {condition: service_healthy}
+      postgres: {condition: service_healthy}
+    environment:
+      <<: *s3-region
+      AWS_ACCESS_KEY_ID: ${SPARK_S3_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${SPARK_S3_SECRET_KEY}
+      PG_USER: ${LAKE_READER_USER}
+      PG_PASSWORD: ${LAKE_READER_PASSWORD}
+      PG_DB: ${POSTGRES_DB}
+    # podrazumevani entrypoint image-a pokrece i Spark master/worker, history i Thrift server (JVM sa 2 GB);
+    # poslovi rade u local rezimu preko spark-submit, pa je dovoljan samo Jupyter
+    entrypoint: ["/bin/notebook"]
+    command: []
+    ports: ["8888:8888", "4040:4040"]
+    volumes:
+      - ./spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - ./jobs:/home/iceberg/jobs
+      - ./sources/files:/home/iceberg/sources
+      - ./results:/home/iceberg/results
+      - ivy-cache:/root/.ivy2
+    mem_limit: 4g
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8888')"]
+      interval: 10s
+      retries: 30
+
+  # ------------------------------------------------------------------ masina 2: Trino (SQL, samo citanje)
+  trino:
+    image: trinodb/trino:470
+    container_name: trino
+    depends_on:
+      iceberg-rest: {condition: service_healthy}
+    environment:
+      TRINO_S3_ACCESS_KEY: ${TRINO_S3_ACCESS_KEY}
+      TRINO_S3_SECRET_KEY: ${TRINO_S3_SECRET_KEY}
+    ports: ["8085:8080"]
+    volumes: [./trino/iceberg.properties:/etc/trino/catalog/lake.properties:ro]
+    mem_limit: 2g
+    healthcheck:   # ugradjeni healthcheck je prestrog kada se ceo stek podize odjednom
+      test: ["CMD", "/usr/lib/trino/bin/health-check"]
+      interval: 10s
+      timeout: 5s
+      start_period: 120s
+      retries: 30
+
+  # ------------------------------------------------------------------ masina 3: Python istrazivac (bez Spark-a)
+  explorer:
+    build: ./pytools
+    image: lakehouse-pytools:1.0
+    container_name: explorer
+    depends_on:
+      iceberg-rest: {condition: service_healthy}
+    environment:
+      <<: *s3-region
+      S3_ACCESS_KEY: ${EXPLORER_S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${EXPLORER_S3_SECRET_KEY}
+    command: >
+      jupyter lab --ip=0.0.0.0 --port=8889 --no-browser --allow-root
+      --IdentityProvider.token='' --ServerApp.password='' --notebook-dir=/app
+    ports: ["8889:8889"]
+    volumes:
+      - ./explorer:/app/explorer
+      - ./generator:/app/generator
+      - ./fingerprints:/app/fingerprints
+      - ./notebooks:/app/notebooks
+      - ./sources/files:/data/sources
+      - ./results:/app/results
+    mem_limit: 2g
+
+  # ------------------------------------------------------------------ prikaz: Lakehouse Console (cita preko Trino-a)
+  console:
+    image: lakehouse-pytools:1.0
+    container_name: console
+    depends_on:
+      trino: {condition: service_healthy}
+      explorer: {condition: service_started}   # explorer gradi zajednicki image
+    environment:
+      <<: *s3-region
+      S3_ACCESS_KEY: ${TRINO_S3_ACCESS_KEY}     # PyIceberg u konzoli cita metapodatke kao korisnik samo za citanje
+      S3_SECRET_KEY: ${TRINO_S3_SECRET_KEY}
+      TRINO_HOST: trino
+      TRINO_PORT: "8080"
+    command: >
+      streamlit run /app/console/app.py --server.port=8501 --server.address=0.0.0.0
+      --server.headless=true --browser.gatherUsageStats=false
+    ports: ["8501:8501"]
+    volumes:
+      - ./console:/app/console
+      - ./explorer:/app/explorer
+      - ./results:/app/results
+    mem_limit: 1g
+
+volumes:
+  minio-data:
+  catalog-data:
+  pg-data:
+  ivy-cache:
